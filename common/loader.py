@@ -1,5 +1,7 @@
+# libraries
 import pandas as pd
 from pathlib import Path
+
 DATA_DIR = Path(__file__).resolve().parents[1] / "datasets"
 
 def load_foundation_food(): return pd.read_csv(DATA_DIR / "foundation_food.csv")
