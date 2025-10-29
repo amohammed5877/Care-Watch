@@ -1,5 +1,7 @@
+# Libraries
 from flask import Flask, request, jsonify
 from common.loader import load_foundation_food, load_food_nutrient, load_nutrient
+
 app = Flask(__name__)
 
 FF = load_foundation_food()
