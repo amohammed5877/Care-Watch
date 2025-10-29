@@ -1,4 +1,6 @@
+# Libraries
 from flask import Flask, request, jsonify
+
 app = Flask(__name__)
 FOOD_VOCAB = {"chicken","rice","biryani","salad","apple","milk","bread","egg"}
 
