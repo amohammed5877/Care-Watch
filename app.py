@@ -1,12 +1,40 @@
+import pandas as pd
+import streamlit as st
+import logging
+
 import io
 from typing import Optional
 
-import pandas as pd
-import streamlit as st
-
 import os
 import json
-import logging
+
+from medical_report_core import extract_metrics_from_report
+from recommender import hybrid_recommend
+
+# -----------------------------------------------------------------------------
+# Application-level logging setup
+# -----------------------------------------------------------------------------
+app_logger = logging.getLogger("carewatch.app")
+if not app_logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        "[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s"
+    )
+    handler.setFormatter(formatter)
+    app_logger.addHandler(handler)
+    app_logger.setLevel(logging.INFO)
+
+app_logger.info("CareWatch Streamlit application started")
+
+
+from mlops_services import (
+    get_food_recommendation,
+    refresh_food_dataset,
+    train_food_health_model,
+    upload_and_extract_report,
+    compute_risk_score,
+    check_and_confirm_latest_report,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,7 +44,7 @@ logger = logging.getLogger("carewatch_app")
 
 # ================== Load secrets / config from environment ==================
 DB_USERNAME = os.getenv("DB_USERNAME")
-DB_PASSWORD = os.getenv("DB_PASSWORD")  # NOTE: we will NOT log this
+DB_PASSWORD = os.getenv("DB_PASSWORD")  
 DB_HOSTNAME = os.getenv("DB_HOSTNAME")
 DB_PORT = os.getenv("DB_PORT")
 
@@ -55,285 +83,326 @@ logger.info("EDA features in use: %s", EDA_FEATURE_NAMES)
 logger.info("ML hyperparameters: %s", ML_HYPERPARAMS)
 logger.info("Streamlit server port (for Docker): %s", STREAMLIT_PORT)
 
-from medical_report_core import (
-    load_foods_table,
-    parse_lab_report_text,
-    classify_lab_metrics,
-    lab_metrics_to_dataframe,
-    get_risk_flags,
-    recommend_foods,
-    foods_to_avoid,
-)
 
-# Real OCR: Tesseract + pdf2image (already installed in your env earlier)
-try:
-    import pytesseract
-    from PIL import Image
-
-    _HAS_TESSERACT = True
-except Exception:
-    pytesseract = None
-    Image = None
-    _HAS_TESSERACT = False
-
-try:
-    from pdf2image import convert_from_bytes
-
-    _HAS_PDF2IMAGE = True
-except Exception:
-    convert_from_bytes = None
-    _HAS_PDF2IMAGE = False
-
-
-# -----------------------------------------------------------------------------
-# Streamlit config + styling (attractive dashboard)
-# -----------------------------------------------------------------------------
-
+# ---------------------------
+# Streamlit Page Config
+# ---------------------------
 st.set_page_config(
-    page_title="CareWatch – Health & Diet Dashboard",
+    page_title="CareWatch – AI Health & Food Recommender",
     layout="wide",
-    page_icon="🩺",
 )
 
-st.markdown(
-    """
-    <style>
-    body {
-        background: linear-gradient(135deg, #f5f7fb 0%, #e3f2fd 40%, #e8f5e9 100%);
-    }
-    .big-title {
-        font-size: 32px;
-        font-weight: 700;
-        color: #1b4b82;
-        text-align: center;
-        margin-bottom: 0.2rem;
-    }
-    .subtitle {
-        font-size: 15px;
-        color: #455a64;
-        text-align: center;
-        margin-bottom: 1.6rem;
-    }
-    .card {
-        background: rgba(255, 255, 255, 0.94);
-        border-radius: 18px;
-        padding: 1.0rem 1.2rem;
-        box-shadow: 0 10px 25px rgba(15, 23, 42, 0.08);
-    }
-    .section-title {
-        font-size: 18px;
-        font-weight: 600;
-        color: #1b4b82;
-        margin-bottom: 0.4rem;
-    }
-    .risk-pill {
-        display: inline-block;
-        padding: 0.2rem 0.65rem;
-        border-radius: 999px;
-        font-size: 12px;
-        font-weight: 600;
-        margin-right: 0.4rem;
-    }
-    .risk-low {
-        background-color: #e8f5e9;
-        color: #2e7d32;
-    }
-    .risk-medium {
-        background-color: #fff3e0;
-        color: #ef6c00;
-    }
-    .risk-high {
-        background-color: #ffebee;
-        color: #c62828;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
-st.markdown("<div class='big-title'>CareWatch – Health & Diet Dashboard</div>", unsafe_allow_html=True)
-st.markdown(
-    "<div class='subtitle'>Upload your medical report to see health metrics and personalised diet suggestions.</div>",
-    unsafe_allow_html=True,
-)
-with st.expander("Experiment configuration", expanded=False):
-    st.write(f"Experiment: {EXPERIMENT_NAME} (v{EXPERIMENT_VERSION})")
-    st.write(f"Expected accuracy: {EXPECTED_ACCURACY}")
-    st.write(f"Training epochs: {TRAIN_EPOCHS}")
-    st.write(f"Features used in EDA/model: {EDA_FEATURE_NAMES}")
-    st.write(f"Docker Hub image owner: {DOCKERHUB_USERNAME}")
+def show_sidebar():
+    with st.sidebar:
+        st.title("CareWatch 🩺🍽️")
 
-# -----------------------------------------------------------------------------
-# OCR helper – uses real OCR engine
-# -----------------------------------------------------------------------------
+        st.markdown(
+            """
+            **How it works (Hybrid Option B + C):**
 
-def run_ocr_on_file(uploaded_file) -> Optional[str]:
-    """
-    Run OCR on the uploaded file and return raw text.
-    Uses real OCR (Tesseract). If you have your own custom OCR pipeline,
-    you can replace this function and keep the rest of the app the same.
-    """
-    if uploaded_file is None:
-        return None
+            1. Upload your **medical report** (PDF or image).
+            2. App runs **real OCR** on the report.
+            3. We extract key metrics:
+               - Glucose
+               - Blood Pressure
+               - Cholesterol
+            4. We classify your **health risk**:
+               - Normal / Borderline / High
+            5. You enter a **food you crave** (e.g., *pizza*).
+            6. App finds **similar foods by nutrients** (sugar, sodium, sat fat, etc.).
+            7. It then labels them as:
+               - ✅ Recommended
+               - ⚠️ Limit
+            """
+        )
 
-    file_bytes = uploaded_file.read()
-    mime = uploaded_file.type or ""
-
-    # PDF -> convert to images then OCR each page
-    if "pdf" in mime.lower():
-        if not (_HAS_PDF2IMAGE and _HAS_TESSERACT):
-            return None
-        pages = convert_from_bytes(file_bytes)
-        text_chunks = [pytesseract.image_to_string(page) for page in pages]
-        return "\n".join(text_chunks)
-
-    # Image input
-    if not _HAS_TESSERACT or Image is None:
-        return None
-
-    image = Image.open(io.BytesIO(file_bytes))
-    return pytesseract.image_to_string(image)
+        st.markdown("---")
+        st.markdown("**Tech stack:**")
+        st.markdown(
+            """
+            - OCR: `pytesseract`, `pdf2image`
+            - ML Similarity: `scikit-learn` (cosine similarity)
+            - UI: `Streamlit`
+            """
+        )
 
 
-# -----------------------------------------------------------------------------
-# Load foods once
-# -----------------------------------------------------------------------------
+def main():
+    show_sidebar()
 
-@st.cache_data(show_spinner=False)
-def get_foods_table() -> pd.DataFrame:
-    return load_foods_table()
+    st.title("CareWatch – AI-Powered Health & Food Recommendations")
 
-
-foods_df = get_foods_table()
-
-# -----------------------------------------------------------------------------
-# Layout – left: upload, right: health overview
-# -----------------------------------------------------------------------------
-
-left_col, right_col = st.columns([1.2, 1.8])
-
-with left_col:
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("<div class='section-title'>1. Upload medical report</div>", unsafe_allow_html=True)
-    uploaded = st.file_uploader(
-        "Upload a lab report image or PDF",
-        type=["png", "jpg", "jpeg", "pdf"],
-        label_visibility="collapsed",
+    st.markdown(
+        """
+        Upload your medical report, then tell the app what you're craving.
+        We'll use your **health metrics + food nutrients** to suggest what to eat
+        and what to limit.
+        """
     )
-    st.markdown("</div>", unsafe_allow_html=True)
 
-# Process OCR + lab metrics
-lab_metrics = None
-metric_summary = []
-metric_df = None
-ocr_error = None
+    # ---------------------------
+    # File Upload: Medical Report
+    # ---------------------------
+    st.subheader("1️⃣ Upload your medical report (PDF or image)")
 
-if uploaded is not None:
-    ocr_text = run_ocr_on_file(uploaded)
-    if not ocr_text:
-        ocr_error = "We could not read text from this file. Please try another image or PDF."
-    else:
-        lab_metrics = parse_lab_report_text(ocr_text)
-        metric_summary = classify_lab_metrics(lab_metrics)
-        metric_df = lab_metrics_to_dataframe(lab_metrics)
-        if not metric_summary:
-            ocr_error = "No familiar glucose, blood pressure, or cholesterol values were found in this report."
+    uploaded_file = st.file_uploader(
+        "Upload lab report / medical summary (PDF, JPG, PNG)",
+        type=["pdf", "png", "jpg", "jpeg"],
+    )
 
-# Right column – metrics + visualisation
-with right_col:
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("<div class='section-title'>2. Health overview</div>", unsafe_allow_html=True)
+    metrics = {}
+    ocr_text_preview = ""
 
-    if uploaded is None:
-        st.info("Upload your medical report to see your metrics and diet suggestions.")
-    elif ocr_error is not None:
-        # Only useful message – no raw OCR text
-        st.warning(ocr_error)
-    else:
-        # Metric cards
-        if metric_summary:
-            c1, c2, c3 = st.columns(3)
-            cards = [c1, c2, c3]
-            for idx, metric in enumerate(metric_summary[:3]):
-                with cards[idx]:
-                    st.markdown("<div class='card'>", unsafe_allow_html=True)
-                    st.metric(
-                        label=metric["metric"],
-                        value=metric["value"],
-                        delta=metric["status"],
-                    )
-                    st.markdown("</div>", unsafe_allow_html=True)
+    if uploaded_file is not None:
+        # Read file bytes safely (works on every rerun)
+        file_bytes = uploaded_file.getvalue()
 
-        # Visualisation (bar chart)
-        if metric_df is not None and not metric_df.empty:
-            import altair as alt
-
-            chart = (
-                alt.Chart(metric_df)
-                .mark_bar()
-                .encode(
-                    x=alt.X("metric:N", title="Metric"),
-                    y=alt.Y("value:Q", title="Value"),
-                    color=alt.Color(
-                        "status:N",
-                        scale=alt.Scale(
-                            domain=["Normal", "Borderline", "Elevated", "High", "High (Stage 1)", "High (Stage 2)"],
-                            range=["#43a047", "#ffb300", "#fb8c00", "#e53935", "#e53935", "#b71c1c"],
-                        ),
-                        legend=None,
-                    ),
-                    tooltip=["metric", "value", "status"],
-                )
-                .properties(height=260)
+        with st.spinner("Running OCR on your report..."):
+            metrics, ocr_text = extract_metrics_from_report(
+                file_bytes=file_bytes,
+                file_name=uploaded_file.name,
             )
-            st.altair_chart(chart, use_container_width=True)
 
-        # Risk pills
-        if lab_metrics:
-            has_diabetes_risk, has_bp_risk, has_chol_risk = get_risk_flags(lab_metrics)
-            parts = []
-            if not (has_diabetes_risk or has_bp_risk or has_chol_risk):
-                parts.append("<span class='risk-pill risk-low'>Overall risk looks low</span>")
+        ocr_text_preview = ocr_text[:800]  # first 800 chars
+
+        st.success("✅ OCR complete.")
+
+        # ---------------------------
+        # Show Extracted Metrics + Visualization
+        # ---------------------------
+        st.subheader("2️⃣ Extracted health metrics")
+
+        if metrics:
+            # Display as a small table
+            metrics_df = (
+                pd.DataFrame([metrics])
+                .T.reset_index()
+                .rename(columns={"index": "Metric", 0: "Value"})
+            )
+
+            st.write("These values are parsed from your report:")
+            st.table(metrics_df)
+
+            # Simple bar chart of metrics
+            st.markdown("**Metrics visualization**")
+            metrics_chart_df = metrics_df.set_index("Metric")
+            st.bar_chart(metrics_chart_df)
+
+        else:
+            st.warning(
+                "Could not automatically detect metrics from the report. "
+                "You can still get recommendations (we'll assume normal risk), "
+                "but for best results, make sure terms like 'glucose', 'cholesterol', "
+                "and 'blood pressure' appear clearly in the report."
+            )
+
+        # OCR text preview (for debugging / transparency)
+        with st.expander("🔍 View OCR text preview (for debugging)"):
+            st.text_area("OCR Text", ocr_text_preview, height=200)
+
+    # ---------------------------
+    # Food Query + Recommendations
+    # ---------------------------
+    st.subheader("3️⃣ Tell us what you're craving")
+
+    food_query = st.text_input(
+        "Example: pizza, burger, fried chicken, biryani, cookies, etc.",
+        value="pizza",
+    )
+
+    # IMPORTANT: this must be aligned with the left margin inside `main()`
+    if st.button("✨ Get AI Recommendations"):
+        if not food_query.strip():
+            st.error("Please type a food name first.")
+            return
+
+        # If no metrics found, fall back to empty dict (treated as 'normal' risk)
+        metrics_to_use = metrics if metrics else {}
+
+        try:
+            with st.spinner("Computing hybrid recommendations..."):
+                risk_level, df_rec, df_lim = hybrid_recommend(
+                    food_query=food_query,
+                    metrics=metrics_to_use,
+                    top_n_similar=20,
+                    top_n_output=5,
+                )
+
+            st.success(f"Detected health risk level: **{risk_level.upper()}**")
+
+            # Layout: Recommended on left, Limit on right
+            col1, col2 = st.columns(2)
+
+            # --- Recommended ---
+            with col1:
+                st.markdown("### ✅ Recommended alternatives")
+                if df_rec is not None and not df_rec.empty:
+                    cols_show = [
+                        c
+                        for c in [
+                            "description",
+                            "rec_label",
+                            "risk_score",
+                            "similarity",
+                            "calories_kcal",
+                            "sugar_g",
+                            "sodium_mg",
+                            "sat_fat_g",
+                            "cholesterol_mg",
+                        ]
+                        if c in df_rec.columns
+                    ]
+                    st.dataframe(df_rec[cols_show])
+                else:
+                    st.info("No strong 'Recommended' alternatives found for this search.")
+
+            # --- Limit ---
+            with col2:
+                st.markdown("### ⚠️ Foods to limit")
+                if df_lim is not None and not df_lim.empty:
+                    cols_show = [
+                        c
+                        for c in [
+                            "description",
+                            "rec_label",
+                            "risk_score",
+                            "similarity",
+                            "calories_kcal",
+                            "sugar_g",
+                            "sodium_mg",
+                            "sat_fat_g",
+                            "cholesterol_mg",
+                        ]
+                        if c in df_lim.columns
+                    ]
+                    st.dataframe(df_lim[cols_show])
+                else:
+                    st.info("No clear 'Limit' items detected among the similar foods.")
+
+            # ---------- Nutrient comparison chart ----------
+            st.subheader("4️⃣ Nutrient comparison: Recommended vs Limit")
+
+            if (
+                df_rec is not None
+                and not df_rec.empty
+                and df_lim is not None
+                and not df_lim.empty
+            ):
+                nutrient_cols = [
+                    "calories_kcal",
+                    "sugar_g",
+                    "sodium_mg",
+                    "sat_fat_g",
+                    "cholesterol_mg",
+                ]
+                nutrient_cols = [
+                    c
+                    for c in nutrient_cols
+                    if c in df_rec.columns and c in df_lim.columns
+                ]
+
+                if nutrient_cols:
+                    comp_df = pd.DataFrame(
+                        {
+                            "nutrient": nutrient_cols,
+                            "Recommended (avg)": [
+                                df_rec[c].mean() for c in nutrient_cols
+                            ],
+                            "Limit (avg)": [df_lim[c].mean() for c in nutrient_cols],
+                        }
+                    ).set_index("nutrient")
+
+                    st.markdown(
+                        "Lower bars on the **Recommended** side are better for sugar, sodium, "
+                        "saturated fat and cholesterol."
+                    )
+                    st.bar_chart(comp_df)
+                else:
+                    st.info("Nutrient columns not available for comparison.")
             else:
-                if has_diabetes_risk:
-                    parts.append("<span class='risk-pill risk-high'>Diabetes risk</span>")
-                if has_bp_risk:
-                    parts.append("<span class='risk-pill risk-high'>Blood pressure risk</span>")
-                if has_chol_risk:
-                    parts.append("<span class='risk-pill risk-high'>Cholesterol risk</span>")
+                st.info("Not enough data to plot nutrient comparison.")
 
-            if parts:
-                st.markdown("<br/>" + " ".join(parts), unsafe_allow_html=True)
+        except Exception as e:
+            st.error(f"Error generating recommendations: {e}")
 
-    st.markdown("</div>", unsafe_allow_html=True)
 
-# -----------------------------------------------------------------------------
-# Diet suggestions – only if we have metrics
-# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    main()
+# -------------------------------------------------------------------------
+# MLOps Pipeline Demo Section (Food Recommendation Service)
+# -------------------------------------------------------------------------
 
-if lab_metrics:
-    st.markdown("<br/>", unsafe_allow_html=True)
+st.markdown("---")
+st.subheader("MLOps Pipeline Demo (Food Recommendation Service)")
 
-    col_rec, col_avoid = st.columns(2)
+with st.form("mlops_food_demo_form"):
+    demo_food_name = st.text_input("Enter a food name for MLOps demo:", "Pizza")
+    demo_age = st.number_input("Age (optional)", min_value=0, max_value=120, value=30)
+    demo_weight = st.number_input(
+        "Weight in kg (optional)", min_value=0.0, max_value=300.0, value=70.0
+    )
+    demo_conditions = st.multiselect(
+        "Health conditions (optional)",
+        ["diabetes", "hypertension", "high_cholesterol"],
+    )
 
-    with col_rec:
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("<div class='section-title'>Recommended foods</div>", unsafe_allow_html=True)
-        rec_foods = recommend_foods(lab_metrics, foods_df, top_n=12)
-        st.dataframe(
-            rec_foods[["description", "sugar_g", "sodium_mg", "sat_fat_g", "cholesterol_mg"]],
-            use_container_width=True,
-            hide_index=True,
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
+    submitted = st.form_submit_button("Run MLOps Food Recommendation Pipeline")
 
-    with col_avoid:
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("<div class='section-title'>Foods to limit</div>", unsafe_allow_html=True)
-        avoid_foods = foods_to_avoid(lab_metrics, foods_df, top_n=12)
-        st.dataframe(
-            avoid_foods[["description", "sugar_g", "sodium_mg", "sat_fat_g", "cholesterol_mg"]],
-            use_container_width=True,
-            hide_index=True,
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
+if submitted:
+    app_logger.info(
+        f"MLOps Food pipeline triggered from UI with "
+        f"food_name={demo_food_name}, age={demo_age}, "
+        f"weight={demo_weight}, conditions={demo_conditions}"
+    )
+
+    # Call the service layer (pipeline stub)
+    result = get_food_recommendation(
+        food_name=demo_food_name,
+        age=int(demo_age) if demo_age else None,
+        weight=float(demo_weight) if demo_weight else None,
+        conditions=demo_conditions if demo_conditions else None,
+    )
+
+    app_logger.info("MLOps Food pipeline completed and response returned to UI")
+
+    st.write("### Service Output")
+    st.json(result)
+
+
+# -------------------------------------------------------------------------
+# MLOps Pipeline Demo Section (Medical Report – OCR + Risk Score)
+# -------------------------------------------------------------------------
+
+st.markdown("---")
+st.subheader("MLOps Pipeline Demo (Medical Report – OCR + Risk Analysis)")
+
+uploaded_demo_report = st.file_uploader("Upload a sample medical report PDF for MLOps demo", type=["pdf"])
+
+if uploaded_demo_report:
+    app_logger.info(
+        f"MLOps Medical pipeline triggered from UI with file_name={uploaded_demo_report.name}"
+    )
+
+    temp_path = "temp_demo_report.pdf"
+    with open(temp_path, "wb") as f:
+        f.write(uploaded_demo_report.getbuffer())
+
+    st.write("📄 **Step 1: Running OCR…**")
+    ocr_result = upload_and_extract_report(temp_path)
+    st.json(ocr_result)
+
+    st.write("📊 **Step 2: Computing Risk Score…**")
+    sample_metrics = {
+        "glucose_fasting": 140,
+        "cholesterol_total": 250,
+        "systolic_bp": 150,
+        "diastolic_bp": 95
+    }
+
+    risk_result = compute_risk_score(sample_metrics)
+    st.json(risk_result)
+
+    app_logger.info("MLOps Medical pipeline completed and response returned to UI")
+
+    st.write("✨ **MLOps Medical Pipeline Executed Successfully!**")

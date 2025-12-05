@@ -4,4 +4,4 @@ numpy
 pytesseract
 pdf2image
 pillow
-
+scikit-learn
